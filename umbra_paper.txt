@@ -1,0 +1,650 @@
+# Tidy Tuples and Flying Start: Fast Compilation and Fast Execution of Relational Queries in Umbra
+
+**Timo Kersten · Viktor Leis · Thomas Neumann**
+
+*Technical University Munich / Friedrich Schiller University Jena*
+
+---
+
+## Abstract
+
+Although compiling queries to efficient machine code has become a common approach for query execution, a number of newly-created database system projects still refrain from using compilation. It is sometimes claimed that the intricacies of code generation make compilation-based engines too complex. Also, a major barrier for adoption, especially for interactive ad-hoc queries, is long compilation time.
+
+In this paper, we examine all stages of compiling query execution engines and show how to reduce compilation overhead. We incorporate the lessons learned from a decade of generating code in HyPer into a design that manages complexity and yields high speed. First, we introduce a code generation framework that establishes abstractions to manage complexity, yet generates code in a single fast pass. Second, we present a program representation whose data structures are tuned to support fast code generation and compilation. Third, we introduce a new compiler backend that is optimized for minimal compile time, and simultaneously, yields superior execution performance to competing approaches, e.g., Volcano-style or bytecode interpretation.
+
+We implemented these optimizations in our database system Umbra to show that it is possible to unite fast compilation and fast execution. Indeed, Umbra achieves unprecedentedly low query latencies. On small data sets, it is even faster than interpreter engines like DuckDB and PostgreSQL. At the same time, on large data sets, its throughput is on par with the state-of-the-art compiling system HyPer.
+
+**Keywords:** Relational Query Execution · Code Generation · Low Latency
+
+---
+
+## 1 Introduction
+
+Query compilation is a widely adopted approach for relational database systems. Creating machine code for every query removes interpretation overhead and allows the database system to extract the highest performance from the underlying hardware. So far, high processing performance was most relevant in the field of in-memory databases. Yet, the growing bandwidth capabilities of solid state drives and non-volatile memory make query compilation attractive for a growing field of hardware configurations.
+
+Compilation works well for large analytical workloads. However, for some use-cases the extra time spent on compilation—the *latency overhead* of compilation—can be a problem. For example, interactive data exploration tools send many queries to the underlying database system; often even multiple queries for a single user interaction. Any overhead from compilation delays the query response and, especially with a large number of queries per interaction, becomes noticeable to the user and causes them to idly wait. Vogelsgesang et al. reported that for the interactive data exploration tool Tableau some queries, even after careful tuning, still take multiple seconds just in compilation step of the underlying database system HyPer. The Northstar project also encountered the issue. They observed that compilation "has an up-front cost, which can quickly add up" and thus severely deteriorates the interactive user experience.
+
+This paper presents multiple components for compiling query engines to achieve low query latency; that is, to minimize the total time spent for query compilation and execution. Compile time must be addressed in the whole compilation pipeline, thus we address every component. We introduce:
+
+1. **Tidy Tuples** – a fast code generation framework
+2. **Umbra IR** – an efficient program representation
+3. **Flying Start** – a compiler to quickly generate machine code
+
+All components are integrated into the database system Umbra and our experiments show that together, they effectively reduce compilation time and maintain high query execution speed.
+
+**Tidy Tuples** lowers algebraic operators to Umbra IR in a single pass for low compilation time and in certain cases utilizes pre-compiled code to avoid compilation time all-together. Tidy Tuples is a latency-streamlined design that achieves code generation up to three orders of magnitude faster than competitors (e.g., 1000× faster than LB2) while still providing a clean, type-safe, and easy to understand interface.
+
+**Umbra IR** is a custom intermediate program representation modelled after LLVM's intermediate representation, but its data structures are optimized for writing and reading speed. We trade off the ability to arbitrarily transform programs for optimal writing and reading speed.
+
+**Flying Start** is a novel compilation backend which transforms Umbra IR directly into machine-code. It reduces query latency in two ways: It minimizes time spent for compilation as it generates machine-code very quickly. Further, it reduces the time spent for execution as the speed of the created machine-code is close to that of thoroughly optimized code. The Flying Start backend is integrated into Umbra through the adaptive execution technique, allowing Umbra to switch dynamically between low-latency compilation with Flying Start and highest-speed query execution by optimizing compilation with LLVM.
+
+### The Performance Gap Problem
+
+Adaptive execution was introduced first to the HyPer query engine. For query execution it has a choice between using intensively optimized code for high-speed execution and two low-latency compilation backends. For low latency, HyPer can either use a bytecode interpreter or the optimizing compiler LLVM with most optimizations turned off. Unfortunately, both options have significant shortcomings: Compilation time with LLVM is not amortized and the bytecode interpretation is so slow that it diminishes the gains from its fast compilation. Ultimately, the query engine is stuck in a performance gap between interpretation and compilation, with no great choice for low query latency.
+
+With the Flying Start backend we show a solution for the low-latency spectrum. It generates code even faster than HyPer's bytecode interpreter and the resulting execution speed is on par with HyPer's LLVM-generated code. Flying Start combines great compilation speed with great execution speed, effectively closing the performance gap.
+
+---
+
+## 2 Tidy Tuples: A Low-Latency Code Generation Framework
+
+The initial component important for low latency is the code generator—the component that lowers relational plans to imperative programs. For maximum speed, we propose to create programs in a single pass over the input.
+
+### 2.1 Background: Compilation Pipeline
+
+A query is parsed to an abstract syntax tree, which is then semantically analyzed and translated to relational algebra. The query optimizer takes the relational algebra tree and creates an optimized physical plan. From the optimized physical plan, the code generator must create a program so that the execution of the program produces the query result.
+
+Tidy Tuples translates the physical plan operator by operator. It instantiates an operator translator for each algebraic operator which is responsible for generating code that will execute its algebra operator. Conceptually, operator translators get tuples from their child operators and pass control to each other following the **produce/consume interface**. During this translation, every translator appends instructions to a program in Umbra IR.
+
+There are two options for converting a program from Umbra IR into an executable: The low-latency Flying Start backend or the LLVM-based optimizing backend. Both produce machine code which computes the query result when executed.
+
+**Two compilation phases:**
+- **System compile time**: C++ source compiled into DBMS binary (happens once)
+- **Query compile time**: SQL query compiled into query-specific binary (happens per query)
+
+Tidy Tuples relies on the C++ type system to ensure correctness of code generated at query compile time. Correctness checks within the C++ type system already happen at system compile time (thus produce no overhead at query compile time).
+
+### 2.2 Layer Overview
+
+The components of Tidy Tuples are arranged into five logical layers:
+
+1. **Operator Translators** – The top-most layer contains algebra operator translators which coordinate in produce-consume style.
+2. **Data Structures** – To handle algorithmic challenges, operator translators use components from the data structure layer, e.g., hash tables (components that generate code to act on hash tables).
+3. **Tuples** – The tuples layer provides operations that work on multiple SQL values, e.g., packing tuples into a memory efficient format and hashing.
+4. **SQL Values** – Operators use the SQL value layer to implement SQL data-type specific parts in which operations on SQL types are performed. These operations include addition, substring search, equality comparison, and many more. The SQL value layer also offers tools to operate on SQL values with standard-conform NULL-semantics.
+5. **Codegen API** – All these layers directly or indirectly use the Codegen layer to append instructions to the output program. Codegen offers operations on low-level types which are close to the hardware, e.g., `Int8`, `UInt64`, `Double`, `Ptr<Int8>`, and also seamlessly integrates C++ types and functions.
+
+These layers are structured from coarse-grained upper layers to fine-grained lower layers. The upper layers perform a lot of work for one operation (e.g., insert all tuples into a hash table), whereas lower layers perform little work for one operation.
+
+### 2.3 From Operators to Instructions
+
+The walk-through inspects the layers along the example of an in-memory hash-join. At the top-most abstraction level the hash-join operator translator must take each incoming tuple from the build side and insert it into a hash-table.
+
+```cpp
+# Layer 1: Operator Translators
+HJTranslator::HJTranslator(CompilationContext& c,
+    algebra::Join& op, Pipeline& p, algebra::IUSet& required){
+  ...
+  hashTable.buildLayout(keys, required /*the payload*/);
+}
+
+void HJTranslator::consume(ConsumerScope& scope) {
+  Ptr<Proxy<HashTable>> ht = ...;
+  if (scope.contains(op.left)){ // build side
+    hashTable.insertEntry(ht, scope);
+  } else ... // probe side
+}
+
+# Layer 2: Data Structures
+void HashTable::insertEntry(Ptr<Proxy<HashTable>> ht,
+    ConsumerScope& scope) {
+  vector<SQLValue> keys, values;
+  for (IU& k : keyIUs) keys.push_back(scope.deriveValue(k));
+  for (IU& v : payloadIUs) values.push_back(scope.deriveValue(v));
+  UInt64 h = Hash::hash(keys);
+  UInt64 size = keyStore.size(keys) + payloadStore.size(values);
+  Ptr<UInt8> entry = Proxy<HashTable>::insert::call(ht, h, size);
+  keyStore.pack(entry, keys);
+  payloadStore.pack(entry + keyStore.size(), values);
+}
+
+# Layer 3: Tuples
+void Storage::pack(Ptr<UInt8> target, vector<SQLValue>& values){
+  unsigned slot = 0;
+  NullIndicator nullIndicator;
+  for (SQLValue& value : values) {
+    Bool isNull = v.null();
+    nullIndicator.store(slot, isNull);
+    {
+      If nullCheck(!isNull);
+      store(target + layout[slot++].offset, value);
+    }
+  }
+  nullIndicator.store(target + layout.nullOffset);
+}
+
+# Layer 5: Codegen
+void Ptr<Int64>::store(Int64& v) {
+  irProgram.createStore64Instr(v.get(), ptr);
+}
+```
+
+### 2.4 SQL Values
+
+The main interface of the SQL Value layer is the `SQLValue` class. A `SQLValue` consists of a NULL indicator, the value, and a SQL type specifier (e.g., `Varchar`, `Integer`). Its general interface to invoke operations are the `evaluateBinary` and `evaluateUnary` functions which apply any of the built-in functions.
+
+`SQLValue` handles nullability by also carrying a NULL indicator, and all operations on `SQLValues` handle NULL propagation as dictated by each specific operation. Furthermore, each operation provides overflow checking and implicit type casting if appropriate.
+
+### 2.5 Primitive Types for Code Generation
+
+Codegen offers classes to generate code for primitive types and uses C++ operator overloading to make it convenient to use. The types are modeled after data types that modern CPUs provide.
+
+**Available types and operations:**
+
+| Type | Available Operations |
+|------|---------------------|
+| (U)Int(8-64) | `+ - * / % ~ & \| ^ << >>`, `ashr rotateL rotateR`, `bswap crc32 == ...` |
+| Bool | `lnot && \|\| select == ...` |
+| Double | `+ - * / % pow == ...` |
+| Data128 | `build extract` |
+| Ptr\<T\> | `load store atomicLoad atomicStore atomicXchg atomicCmpXchg refMember` |
+
+Example hash function generation:
+
+```cpp
+# Tuples layer
+UInt64 Hash::hashValues(vector<SQLValue> values) {
+  ... // Concat. all low-level types to 64bit integers
+  UInt64 hash1(6763793487589347598);
+  UInt64 hash2(4593845798347983834);
+  for (UInt64 v : concatenatedValues) {
+    hash1 = hash1.crc32(v); hash2 = hash2.crc32(v);
+  }
+  UInt64 hash = hash1 ^ hash2.rotateRight(32);
+  hash *= 11400714819323198485;
+  ...
+  return hash;
+}
+```
+
+This generates the following IR:
+
+```
+%1 = zext i64 %int1
+%2 = zext i64 %int2
+%3 = rotr i64 %2, 32
+%v = or i64 %1, %3
+%5 = crc32 i64 6763793487589347598, %v
+%6 = crc32 i64 4593845798347983834, %v
+%7 = rotr i64 %6, 32
+%8 = xor i64 %5, %7
+%hash = mul i64 %8, 11400714819323198485
+```
+
+### 2.6 Host Language Integration
+
+To enable seamless integration between generated and precompiled code, Codegen provides a system of **proxies** that lets us generate operations on any C++ class. We can access data members and call member functions from generated code.
+
+For every feature to implement, the proxy system offers a choice of whether to write code that generates code or to implement the functionality in C++ and call it from generated code. The advantage of the latter option is reduced code generation time.
+
+The proxy system has the valuable property that it reduces query compile time by incorporating precompiled snippets, yet does not sacrifice peak execution performance. The proxy system allows that a programmer can mark functions to be inlined. The Flying Start backend will ignore this inlining marker and only profit from lower compilation time. The optimizing backend will react to the marker and inline the function at all call sites.
+
+### 2.7 Control Flow
+
+Codegen provides classes for three control-flow constructs: `If`, `Loop`, and `Function`. They need to handle two aspects: **Basic blocks** and **PHI nodes**.
+
+Generating SSA (Static Single Assignment) form directly is important for compilation speed, as it removes the necessity to run an extra compiler pass.
+
+Loops often need to update values in every iteration. In SSA form, however, no values can be updated. Instead, the `Loop` class internally uses PHI nodes to pass values to subsequent loop iterations and uses these to present a concept of loop variables to the user.
+
+```cpp
+# Data Structures layer
+void ChainingHashTable::probe(
+    Ptr<Proxy<HashTable>> table,
+    vector<SQLValue> key,
+    FunctionRef<void(...)>& callback){
+  UInt64 hash = Hash::hashValues(key);
+  auto entry = Proxy<HashTable>::lookup::call(table, hash);
+  {
+    Loop<Ptr<UInt8>> loop("chain", entry.notNull(), {{entry}});
+    Ptr<UInt8> iter = loop.getLoopVar<0>();
+    vector<SQLValue> found = keyStore.unpack(iter + header);
+    ConsumerScope::testValuesEq(key, found, loop.continueBlock());
+    callback(loop.cntBlk(), loop.breakBlk(), iter);
+    loop.continueSequence();
+    Ptr<UInt8> next = Proxy<HashTable>::next::call(table, iter);
+    loop.done(next.notNull(), {next});
+  }
+}
+```
+
+---
+
+## 3 Umbra Program Representation
+
+A second element important for query latency in the compilation pipeline are the programs the code generator creates. We designed an intermediate representation called **Umbra IR**. It serves as intermediary between code generator and compilation backends.
+
+Key design goals:
+- Fast creation of programs (write speed)
+- Fast reading by compilation backends (read speed)
+- Low memory allocation cost
+- Compact representation for cache efficiency
+
+### 3.1 Umbra IR Structure
+
+A program in Umbra IR consists of **functions**, **basic blocks**, and **instructions**:
+
+- **Functions** contain basic blocks of which one is the entry point
+- **Basic blocks** contain sequences of instructions executed in order; each must be terminated by a control flow instruction
+- **Instructions** include: arithmetic, loading/storing values, comparisons, casts, atomic memory operations, function calls, returns, branches, conditional branches, and switch
+
+Example:
+```
+define i1 foo(i32 %x){
+start:
+  %1 = cmpgt i32 5, %x
+  condbr %1, %yes %no
+yes:
+  ret 1
+no:
+  ret 0
+}
+```
+
+### 3.2 Physical Program Layout
+
+Three properties of the code generation pipeline are exploited:
+- Code generation **mostly appends instructions** at the end of basic blocks. We do not move instructions.
+- Code generation has **high locality**. We generally first complete one basic block/function before moving to the next.
+- **All instructions have the same lifetime** as the program.
+
+The first ingredient is a **variable length instruction format**. All 104 instructions begin with an opcode which identifies the instruction—and determines its length—followed by a type identifier that specifies the result type.
+
+All instructions of a program are stored in a **dynamic array**. This keeps instructions grouped together in memory and appending instructions does not require allocations (most of the time). It also enables referencing instructions with a **4-byte offset** into the array—saving space while still allowing low-overhead reference following.
+
+The basic blocks of a program are similarly stored consecutively in memory. A basic block contains a dynamic array of instruction offsets. Each function contains only the offset of the first basic block; all other basic blocks are discoverable through the branches at the end of each block.
+
+### 3.3 Constants and Dead-Code Removal
+
+Two important optimizations are applied on-the-fly:
+
+1. **Constant folding**: Applied to instructions at the moment they are appended to the program; constants are also deduplicated.
+
+2. **Dead code elimination (DCE)**: Removes all instructions whose results are not used by any other instruction, and any unreachable blocks. This gives code generators freedom to emit instructions without carefully determining all users beforehand, simplifying the generator.
+
+### 3.4 DBMS-Specific Instructions
+
+Custom IR allows co-designing the instruction set with the database system:
+
+- **Checked arithmetic**: Branches when an overflow occurs.
+  ```
+  %c = checkedsadd i32 %a, %b %continue %overflow
+  ```
+- **Inlined address calculation**: Load and store instructions can inline address calculation (getelementptr), yielding a more compact representation.
+- **Dedicated instructions**: `isNull`, CRC checksums, bit rotation, 128-bit data type.
+
+### 3.5 Comparison to LLVM IR
+
+Umbra IR is closely related to LLVM IR in terms of semantics. However, LLVM IR is designed to be more generic to support a wide variety of optimization passes, with an emphasis on instruction reordering, replacement, and deletion. This generality entails a performance penalty which Umbra IR avoids by trading off flexibility for optimal read/write speed.
+
+---
+
+## 4 Flying Start Backend
+
+The goal of the Flying Start compilation backend is to reduce query latency—the sum of compile time and query runtime. Flying Start is the default backend for adaptive execution, so compile time should be as low as possible while simultaneously creating fast code.
+
+**Core approach**: Start from the most basic machine code generator possible—map each Umbra IR instruction to exactly one sequence of x86-instructions. No choices or optimizations involved, so this is the fastest way to generate machine code. Then apply cheap optimizations on-the-fly.
+
+**Optimizations applied (in order):**
+1. Stack Space Reuse
+2. Machine Register Allocation
+3. Lazy Address Calculation
+4. Fuse Comparison and Branch
+
+### 4.1 Background: Adaptive Execution
+
+Adaptive execution switches dynamically between execution backends at runtime—even half-way through a query—to profit from fast compilation for short-running queries and from fast execution for long-running queries.
+
+Umbra applies the adaptive execution approach with two backends:
+- **Flying Start**: for fast compilation (default)
+- **LLVM optimizing compiler**: for peak execution performance
+
+### 4.2 Minimal Compile-Time Design
+
+The most basic variant of Flying Start uses a single pass over all instructions to generate machine code:
+
+```
+function COMPILE(Program p)
+  for Function f ∈ p; Block b ∈ f; Instruction i ∈ b do
+    TRANSLATE(i)
+  end for
+end function
+
+function TRANSLATE(AddInstruction i)
+  scratch ← allocScratchRegister()
+  firstArgSlot ← i.firstArg()
+  secondArgSlot ← i.secondArg()
+  result ← allocStackSlotFor(i)
+  emit "copy firstArgSlot into scratch register"
+  emit "add secondArgSlot onto scratch register"
+  emit "copy scratch register value to result"
+  free(scratch)
+end function
+```
+
+For example, the add instruction generates:
+```asm
+mov eax, [rsp+firstArgSlot]  ; Copy arg. into scratch
+add eax, [rsp+secondArgSlot] ; Add arg. onto scratch
+mov [rsp+result], eax        ; Copy result on stack
+```
+
+Drawbacks: All values stored on stack causes extra memory traffic, superfluous copies, and more stack space than necessary.
+
+### 4.3 Stack Space Reuse
+
+Flying Start reuses a stack slot once it knows the value occupying the slot is never used again. It arranges basic blocks in **reverse post-order** and calculates **live spans** of all values using a linear-time algorithm.
+
+The live span of a value is the interval from first to last point in the program where the value is live. Compared to detailed liveness information computed by data-flow analysis, live spans are only an approximation, but can be calculated in linear time and require little memory space per value.
+
+Example: After addition of `%1 + %2 = %3`, the stack slot of `%1` will not be used again. `%3` can reuse that slot. In the next instruction, `%5` can reuse the slot again.
+
+Stack space reuse introduces one additional pass to determine value live-spans. However, it decreases the memory footprint of the resulting code, increases cache friendliness, and enables the next optimization.
+
+### 4.4 Machine Register Allocation
+
+A major issue is the superfluous `mov` instructions to retrieve values from stack and put back results. For two consecutive additions without register allocation:
+
+```asm
+mov rax, [rsp+slot1]  ; Data movement
+add rax, [rsp+slot2]  ; Actual operation
+mov [rsp+slot1], rax  ; Data movement
+mov rax, [rsp+slot1]  ; Data movement
+add rax, [rsp+slot3]  ; Actual operation
+mov [rsp+slot1], rax  ; Data movement
+```
+
+With register allocation:
+```asm
+add r9, r10  ; Add second arg. onto first
+add r9, r11  ; Add third arg. onto prev. result
+```
+
+Out of the available 16 registers on x86: 4 are scratch registers, 1 contains the stack pointer, and the remaining **11 registers** store values beyond the translation of a single IR instruction.
+
+**Register allocation heuristic**: Assign machine registers to values that either (a) only live within the block they were created in, or (b) were created in the most deeply nested loop. This shifts register usage to passing of intermediate data and into loops, reducing generated instructions and memory accesses.
+
+### 4.5 Lazy Address Calculation
+
+Generated code frequently accesses different elements of one tuple or data structure, leading to chains of multiple address calculation (`getelementptr`) instructions.
+
+The x86 instruction set allows integrating address calculation into instruction operands. By delaying address calculation—keeping the form `[base + offset]` instead of fully resolving to a pointer—the compiler can use composite forms in instruction operands:
+
+```asm
+mov r9, [rdx + offset]  ; Integrated addressing
+```
+
+This saves an extra `add` instruction and an extra register.
+
+### 4.6 Fuse Comparison and Branch
+
+Comparisons in Umbra IR result in a Boolean value which conditional branches take as input. In x86, a comparison sets a special flags register and branches take the flags as input.
+
+Without fusion:
+```asm
+cmp r9, 64    ; compare
+setlt r13b    ; retrieve cmp. result from flags register
+cmp r13b, 1  ; put decision into flags register
+jnz .block1  ; branch, depending on flags value
+```
+
+With fusion (deferred translation):
+```asm
+cmp r9, 64  ; compare
+jl .block1  ; branch, depending on flags value
+```
+
+**Implementation**: Within a basic block, defer translation of all but load, store, and control-flow instructions. Instructions are translated at the latest possible time—when their results are required. A branch instruction can pass a placement hint to the comparison instruction to put its result in the flags register.
+
+### 4.7 Implementation of Flying Start
+
+```cpp
+void translateAddInstruction(IRValue v) {
+  AddInstruction* i = get<BinaryInstruction>(v);
+  Reg value1 = argumentReg(i->arg[0]);  // First arg.
+  Reg value2 = argumentReg(i->arg[1]);  // Second arg.
+  Reg result = resultReg(v);            // Result info
+  ScratchReg scratch1(*this);           // Acquire scratch reg
+  Operand arg1 = get(value1, scratch1); // To scratch
+  Operand arg2 = get(value2);           // Get as mem. operand
+  assembler.emit(X86Inst::Add, arg1, arg2);
+  put(result, arg1);  // Move result to assigned spot
+  // Destruct Regs and ScratchReg. Yield resources
+}
+```
+
+The `Reg` and `ScratchReg` classes perform book-keeping of values and free registers. They determine where inputs are located, where results should be placed, and which temporary registers to use.
+
+```cpp
+Reg resultReg(IRValue v) {
+  if (notConst(v)) {
+    if (registersAvailable() &&
+        (onlyLiveInCurrentBlock(v) ||
+         loopIsDeepestNest())) {  // heuristic
+      Location& l = allocateRegister(v);
+      return Reg(RegisterVariable, v, l, this);
+    } else {
+      Location& l = allocateStackSlot(v);
+      return Reg(StackVariable, v, l, this);
+    }
+  }
+}
+
+Reg argumentReg(IRValue v, LocationHint h = None) {
+  if (notConst(v)) {
+    Location& l = lookupValueLocation(v);
+    if (!l.assigned) translate(v, h);  // On-demand translation
+    return Reg(l.type, v, l, this);
+  }
+}
+
+Reg::~Reg() {
+  if (--location.references == 0)
+    freeResources();  // return register or stack slot to allocator
+}
+```
+
+The implementation uses the **asmJIT library** to directly assemble x86 instructions.
+
+Flying Start targets x86. For other architectures (e.g., ARM), the individual translation of Umbra IR instructions to the target instruction set must be adapted. However, infrastructure for live span analysis, register allocation, book keeping, and scratch register handling can be reused.
+
+---
+
+## 5 Evaluation
+
+### 5.1 Experimental Setup
+
+- Machine: 10-core Intel Skylake X i9-7900X @ 3.4 GHz (4.5 GHz turbo), 20 hyperthreads, 32 kB L1-cache per core, 14 MB LLC, 128 GB DRAM, 56 GB/s bandwidth, Ubuntu 19.04, kernel 5.0.0
+- Workload: TPC-H benchmark, scale factors 0.001 (10k tuples) to 30 (260M tuples)
+- Competitors: HyPer (compiling), PostgreSQL 11.7 (tuple-at-a-time interpreter), MonetDB 11.33.11 (vectorized), DuckDB (vectorized)
+- Note: Index and bitmap scans disabled in PostgreSQL for comparable query plans
+
+### 5.2 Query Latency: Compile Time + Runtime
+
+**Key finding**: Umbra with Flying Start provides high query throughput over a wide range of data set sizes—consistently outperforming all competitors. The measurement includes both compilation time and execution time.
+
+- On **small datasets**: Umbra with Flying Start answers queries faster than interpreter-based systems (DuckDB, MonetDB, PostgreSQL), which spend no time to generate code at all.
+- On **large datasets**: Flying Start produces sufficient code quality to out-perform other approaches on data sets with hundreds of millions of tuples.
+- Across **thread counts** (1 to 20): Umbra answers queries faster than MonetDB (fastest competitor) in all configurations.
+
+### 5.3 Compilation Time
+
+Detailed timing breakdown (SF=0.01, single thread, geometric mean over TPC-H queries):
+
+| System | Plan (ms) | Code Gen (ms) | Machine Code (ms) | Exec (ms) | Total (ms) |
+|--------|-----------|---------------|-------------------|-----------|------------|
+| Umbra Flying Start | 0.25 | 0.20 | 0.21 | 0.50 | 1.24 |
+| HyPer bytecode | 0.26 | 0.60 | 0.47 (bc) | 3.33 | 5.06 |
+| DuckDB | 0.53 | — | — | 0.84 | 1.46 |
+| MonetDB | 1.53 | — | — | 8.50 | 10.82 |
+| PostgreSQL | 0.47 | — | — | 5.72 | 6.40 |
+
+**Umbra IR vs. LLVM IR**: Umbra's code generation is **2× faster** than HyPer's (0.20 ms vs. 0.60 ms). Flying Start is also faster at x86 generation than HyPer at bytecode generation.
+
+**Large queries** (join experiment with up to 2000 self-joins of `nation`):
+- LLVM: 150 seconds to compile
+- LLVM Fast ISel: 4 seconds
+- Flying Start: < 0.04 seconds
+
+### 5.4 Runtime Performance Robustness
+
+Comparison of Umbra's Flying Start vs. HyPer's backends (geometric mean over TPC-H, SF=1, 20 threads):
+
+| Backend Comparison | Compilation | Execution |
+|-------------------|-------------|-----------|
+| Umbra Flying Start vs. LLVM O3 | 108× faster | 1.2× slower |
+| HyPer Interpreter vs. LLVM O3 | 91× faster | 4.1× slower |
+| HyPer LLVM O0 vs. LLVM O3 | 6× faster | 1.3× slower |
+
+**Key insight**: HyPer must juggle three execution backends with different tradeoffs, requiring careful selection. Umbra needs only two backends—Flying Start combines the best of HyPer's bytecode interpreter (compilation speed) and unoptimized LLVM (execution speed) into one. A wrong choice between Umbra's backends has only a 1.2× impact vs. potentially 4.1× for HyPer.
+
+### 5.5 Flying Start Optimizations
+
+Effect of each optimization (geometric mean over TPC-H, SF=1, single thread):
+
+**Execution time reduction:**
+- Stack Reuse: ~0% direct, but enables register allocation
+- Register Allocation: **~32% reduction** (largest effect)
+- Address Calculation: moderate effect
+- Fuse Comparison/Branch: moderate effect, most pronounced on Q18
+- Overall with all optimizations: **~36% reduction** in cycles/tuple
+
+**Compilation time overhead:**
+- Value-lifetime computation (for stack reuse): +45% to compilation time
+- All further optimizations (register allocation, address calc, branch fusion): offset their cost by reducing emitted instructions
+
+**Flying Start vs. LLVM code quality** (violin plots over TPC-H):
+- Cycles: median ~1.6× more than LLVM-optimized
+- Instructions: ~2.3× more (Flying Start produces some extra instructions)
+- IPC: ~1.4× higher (hardware executes more instructions per cycle in parallel)
+- Branch misses: comparable
+- LLC misses: comparable
+- Code size: ~2.4× larger
+
+**Linear Scan register allocation** (tested as alternative to heuristic):
+- 1% faster execution
+- 14% more compilation time
+- Chosen not to include in default Flying Start optimizations
+
+**Dead Code Elimination** (applied during code generation, not by Flying Start):
+- Removes ~4% of instructions
+- Quick pass; reduces subsequent compile- and runtime
+- Net benefit positive
+
+### 5.6 Implementation Effort
+
+Lines of C++ code for Tidy Tuples and Flying Start:
+
+| Component | Headers | C++ Impl | Tests |
+|-----------|---------|----------|-------|
+| Operator Translators | 2,360 | 8,347 | 3,225 |
+| Data Structures | 187 | 399 | 113 |
+| Tuples | 172 | 1,019 | 2,205 |
+| SQL Values | 772 | 6,834 | 2,283 |
+| Codegen | 975 | 1,049 | 690 |
+| **Σ Tidy Tuples** | **4,466** | **17,648** | **8,516** |
+| Umbra IR | 812 | 2,348 | 476 |
+| Flying Start | 399 | 3,790 | 1,072 |
+| **Σ All** | **5,677** | **23,786** | **10,064** |
+
+Operator translators include: table scan, nested-loop join, hash join, multi-way join, group-join, group by, sort, map, select, set operations, expressions, recursive views, and more.
+
+---
+
+## 6 Related Work
+
+**Vectorization** (MonetDB, DuckDB): Reduces Volcano-style interpretation overhead by operating on many tuples at once. Generally easier to build, lower latency since no machine code generation. Drawbacks with complicated expressions and few tuples.
+
+**Compilation-based engines** (HyPer): Eliminate interpretation overhead by generating query-specific machine code. The produce-consume model from HyPer was criticized as too low-level.
+
+**LegoBase**: Gradually lowers query plan through a cascade of intermediate representations; each lowering is less complex. Using multiple representations was criticized as adding unnecessary complexity.
+
+**LB2**: Uses Scala language features and compiler extensions to implement the Futamura projection—specialize an interpreter to obtain a code generator. Code generation from the same code base as the interpreter. Reports 299 ms geometric mean code generation time over TPC-H, fundamentally limiting to ~3 queries/second.
+
+**Adaptive execution** (Kohn et al.): Combines interpreter and code generator for HyPer to achieve low latency for cheap queries and fast execution for expensive queries.
+
+**Destination-driven code generation** (Dybvig et al.): Generates machine code directly from AST. Uses one register to transfer intermediate values between neighboring AST nodes. Flying Start builds on these ideas but operates on Umbra IR where each value can have multiple users.
+
+**V8 Liftoff backend**: WebAssembly compiler backend inspired by destination-driven code generation; single-pass low-latency compilation. Uses WebAssembly's stack machine model which implicitly encodes value lifetimes.
+
+**Flounder IR**: Program representation relying on the code generator to encode value lifetimes, estimated using relational operator lifetimes. These overestimate actual lifetimes for TPC-H queries, causing register shortages.
+
+**Tidy Tuples contributions** relative to prior work:
+- Layered architecture that conceptually incorporates gradual lowering (LegoBase) but achieves code generation in a single step
+- Uses code generator interface with host language type system (like LB2), but without building a full interpreter, enabling tight control of SQL compile time optimizations
+- Seamless integration of generated code with host language code (difficult with JVM)
+- Directly creates SSA form, skipping an extra optimization pass
+- Produce-consume model (not Volcano-style iteration) to avoid extensive compiler optimizations for efficiency
+
+---
+
+## 7 Summary
+
+This paper presented:
+
+1. **Tidy Tuples**: A layered code generation architecture that manages complexity while achieving code generation 1000× faster than alternatives. Generates programs in a single pass. Leverages the C++ type system for correctness, uses pre-compiled host language code where possible to reduce code generation time, and directly generates SSA form.
+
+2. **Umbra IR**: A custom intermediate representation with data structures optimized for write and read speed. Stores instructions in contiguous memory arrays for cache efficiency. Includes database-specific instructions (checked arithmetic, NULL checks, CRC). Achieves 2× faster code generation than LLVM IR.
+
+3. **Flying Start**: A compiler backend that directly generates x86 machine code from Umbra IR in (at most) two passes. Applies cheap optimizations (stack space reuse, register allocation, lazy address calculation, comparison-branch fusion) that significantly improve code quality with minimal compilation overhead. Achieves 108× faster compilation than LLVM O3 at only 1.2× slower execution.
+
+**Overall result**: Umbra with Flying Start reaches the latency realms of interpretation-based engines (DuckDB, MonetDB, PostgreSQL) while maintaining execution speed competitive with state-of-the-art compiling systems (HyPer) for large datasets. The combination is effective across dataset sizes from 10k to 260M tuples and across thread counts from 1 to 20.
+
+**Recommendation**: Use a fast compiler that directly generates machine code (Flying Start style) as the default, falling back to an optimizing compiler (LLVM) for long-running queries. This approach reaches low-latency realms of interpreter engines while keeping high execution speed, making it well-suited for mixed workloads of many small queries intermixed with large queries—as regularly happens during interactive database use.
+
+---
+
+## References
+
+1. Agarwal et al. Apache Spark as a compiler. Databricks blog (2016)
+2. Boncz et al. MonetDB/X100: Hyper-pipelining query execution. CIDR (2005)
+3. Boncz et al. Breaking the memory wall in MonetDB. CACM 51(12) (2008)
+4. Click. Global code motion / global value numbering. SIGPLAN (1995)
+5-6. Crotty et al. Tupleware / UDF-centric workflows. PVLDB / CIDR (2015)
+7. Diaconu et al. Hekaton: SQL server's memory-optimized OLTP engine. SIGMOD (2013)
+8. Dybvig et al. Destination-driven code generation. Indiana University (1990)
+9. Funke et al. Efficient generation of machine code for query compilers. DaMoN (2020)
+10. Gupta et al. Amazon Redshift. SIGMOD (2015)
+11. Haas et al. Exploiting directly-attached NVMe arrays in DBMS. CIDR (2020)
+12. Hammacher. V8 Liftoff. https://v8.dev/blog/liftoff (2018)
+13. Karpathiotakis et al. Just-in-time data virtualization: ViDa. CIDR (2015)
+14. Kersten et al. Everything you always wanted to know about compiled and vectorized queries. PVLDB 11(13) (2018)
+15. Klonatos et al. Building efficient query engines in a high-level language. PVLDB 7(10) (2014)
+16. Kobalicek. asmJIT. https://github.com/asmjit/asmjit (2014)
+17. Koch et al. DBToaster. VLDB J. 23(2) (2014)
+18. Kohn et al. Adaptive execution of compiled queries. ICDE (2018)
+19. Kraska. Northstar: An interactive data science system. PVLDB 11(12) (2018)
+20. Krikellas et al. Generating code for holistic query evaluation. ICDE (2010)
+21. Lattner & Adve. LLVM: A compilation framework. CGO (2004)
+22. Leis et al. Morsel-driven parallelism. SIGMOD (2014)
+23. Menon et al. Relaxed operator fusion for in-memory databases. PVLDB 11(1) (2017)
+24. Moerkotte. Building query compilers.
+25. Neumann. Efficiently compiling efficient query plans for modern hardware. PVLDB 4(9) (2011)
+26. Neumann. Linear time liveness analysis. Database Architects blog (2020)
+27. Neumann & Freitag. Umbra: A disk-based system with in-memory performance. CIDR (2020)
+28. Neumann & Leis. Compiling database queries into machine code. IEEE Data Eng. Bull. 37(1) (2014)
+29. Neumann et al. The complete story of joins (in HyPer). BTW (2017)
+30-31. Palkar et al. Weld / Common runtime for high performance data analysis. PVLDB / CIDR (2017/2018)
+32-33. Pall. LuaJIT optimizations and SSA-IR. LuaJIT wiki (2012/2013)
+34. Paroski. Code generation: The inner sanctum of database performance. (2016)
+35. Pirk et al. Thriving in the no man's land between compilers and databases. CIDR (2019)
+36. Pirk et al. Voodoo - a vector algebra for portable database performance. PVLDB 9(14) (2016)
+37. Poletto et al. tcc: A system for fast, flexible dynamic code generation. SIGPLAN (1997)
+38. Poletto & Sarkar. Linear scan register allocation. TOPLAS (1999)
+39. Raasveldt & Mühleisen. DuckDB: an embeddable analytical database. SIGMOD (2019)
+40. van Renen et al. Managing non-volatile memory in database systems. SIGMOD (2018)
+41. Shaikhha et al. Push versus pull-based loop fusion in query engines. JFP 28 (2018)
+42-44. Shaikhha et al. Building efficient query engines / How to architect a query compiler. SIGMOD (2016/2018)
+45. Vogelsgesang et al. Get real: How benchmarks fail to represent the real world. DBTest (2018)
+46. Wanderman-Milne & Li. Runtime code generation in Cloudera Impala. IEEE Data Eng. Bull. 37(1) (2014)
+47-48. Zhang et al. Micro-specialization in DBMSes. CGO / ICDE (2012)
