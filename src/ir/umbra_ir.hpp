@@ -286,7 +286,7 @@ public:
     // Constant folding: done inside addBinary/addUnary
     // Returns NullRef if no fold possible
     IRValueRef tryConstFold(Opcode op, IRType t,
-                            IRValueRef a, IRValueRef b) const;
+                            IRValueRef a, IRValueRef b);
 
     // Dead code elimination: remove instructions with zero uses
     // (terminators and stores are always kept)

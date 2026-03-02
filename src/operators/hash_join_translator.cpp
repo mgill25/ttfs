@@ -14,16 +14,27 @@ void RuntimeHashTable::insert(RuntimeHashTable* ht, uint64_t hash,
     ht->buckets[bucket].push_back(std::move(entry));
 }
 
-HTEntry* RuntimeHashTable::lookup(RuntimeHashTable* ht, uint64_t hash,
-                                   const int64_t* probeKeys, int numKeys) {
+RuntimeHashTable* RuntimeHashTable::lookupAll(RuntimeHashTable* ht, uint64_t hash,
+                                               const int64_t* probeKeys, int numKeys) {
     size_t bucket = hash % NUM_BUCKETS;
+    ht->matchBuffer.clear();
     for (HTEntry& entry : ht->buckets[bucket]) {
         bool match = true;
         for (int i = 0; i < numKeys && match; ++i)
             if (entry.keyData[i] != probeKeys[i]) match = false;
-        if (match) return &entry;
+        if (match) ht->matchBuffer.push_back(&entry);
     }
-    return nullptr;
+    return ht;
+}
+
+int64_t RuntimeHashTable::matchCount(RuntimeHashTable* ht) {
+    return static_cast<int64_t>(ht->matchBuffer.size());
+}
+
+HTEntry* RuntimeHashTable::matchAt(RuntimeHashTable* ht, int64_t idx) {
+    if (idx < 0 || idx >= static_cast<int64_t>(ht->matchBuffer.size()))
+        return nullptr;
+    return ht->matchBuffer[static_cast<size_t>(idx)];
 }
 
 // ─── HashJoinTranslator ─────────────────────────────────────────────────────
@@ -146,20 +157,20 @@ void HashJoinTranslator::consumeProbeSide(ConsumerScope& scope) {
     // 1. Hash the probe keys
     UInt64 hash = hashValues(cg, probeKeyVals);
 
-    // 2. Emit call to RuntimeHashTable::lookup
+    // 2. Emit call to RuntimeHashTable::lookupAll
     IRValueRef htPtr = prog.addConstInt(
         reinterpret_cast<int64_t>(hashTable), IRType::Ptr);
 
     int nKeys = (int)probeKeyVals.size();
     hashTable->numKeyFields = nKeys;
 
-    using LookupFn = HTEntry*(*)(RuntimeHashTable*, uint64_t,
-                                   int64_t, int64_t, int64_t, int64_t);
-    static LookupFn lookupFn = [](RuntimeHashTable* ht, uint64_t hash,
-                                   int64_t k0, int64_t k1,
-                                   int64_t k2, int64_t k3) -> HTEntry* {
+    using LookupAllFn = RuntimeHashTable*(*)(RuntimeHashTable*, uint64_t,
+                                             int64_t, int64_t, int64_t, int64_t);
+    static LookupAllFn lookupAllFn = [](RuntimeHashTable* ht, uint64_t hash,
+                                        int64_t k0, int64_t k1,
+                                        int64_t k2, int64_t k3) -> RuntimeHashTable* {
         int64_t keys[4] = {k0, k1, k2, k3};
-        return RuntimeHashTable::lookup(ht, hash, keys, ht->numKeyFields);
+        return RuntimeHashTable::lookupAll(ht, hash, keys, ht->numKeyFields);
     };
 
     std::vector<IRValueRef> lookupArgs = {htPtr, hash.ref};
@@ -168,58 +179,90 @@ void HashJoinTranslator::consumeProbeSide(ConsumerScope& scope) {
         lookupArgs.push_back(prog.addConstInt(0, IRType::Int64));
     }
 
-    IRValueRef entryPtr = prog.addCall(IRType::Ptr,
-                                        reinterpret_cast<uint64_t>(lookupFn),
-                                        lookupArgs);
+    IRValueRef matchesPtr = prog.addCall(IRType::Ptr,
+                                         reinterpret_cast<uint64_t>(lookupAllFn),
+                                         lookupArgs);
 
-    // 3. Check if lookup returned non-null (there is a matching entry)
-    IRValueRef nullPtr = prog.addConstInt(0, IRType::Ptr);
-    IRValueRef hasMatch = prog.addBinary(Opcode::CmpNe, IRType::Bool,
-                                          entryPtr, nullPtr);
+    using MatchCountFn = int64_t(*)(RuntimeHashTable*);
+    static MatchCountFn matchCountFn = [](RuntimeHashTable* ht) -> int64_t {
+        return RuntimeHashTable::matchCount(ht);
+    };
+    IRValueRef totalMatches = prog.addCall(
+        IRType::Int64,
+        reinterpret_cast<uint64_t>(matchCountFn),
+        {matchesPtr});
 
-    Bool hasMatchBool{hasMatch, &cg};
-    IfStmt ifMatch(cg, hasMatchBool);
-    {
-        // 4. Load the payload from the matched entry
-        // payload is at entry->payloadData.data()[i]
-        // We emit calls to a helper that returns payload[i]
-        using GetPayloadFn = int64_t(*)(HTEntry*, int32_t);
-        static GetPayloadFn getPayloadFn = [](HTEntry* e, int32_t i) -> int64_t {
-            return e->payloadData[i];
-        };
+    using MatchAtFn = HTEntry*(*)(RuntimeHashTable*, int64_t);
+    static MatchAtFn matchAtFn = [](RuntimeHashTable* ht, int64_t idx) -> HTEntry* {
+        return RuntimeHashTable::matchAt(ht, idx);
+    };
 
-        ConsumerScope joinScope;
-        joinScope.mergeFrom(scope);  // include probe side values
+    // 3. Iterate all matches and emit one joined tuple per match.
+    IRValueRef zero = prog.addConstInt(0, IRType::Int64);
+    IRValueRef one  = prog.addConstInt(1, IRType::Int64);
 
-        // Bind build key IUs by loading from HTEntry::keyData
-        using GetKeyFn = int64_t(*)(HTEntry*, int32_t);
-        static GetKeyFn getKeyFn = [](HTEntry* e, int32_t i) -> int64_t {
-            return e->keyData[i];
-        };
-        for (size_t i = 0; i < buildKeys.size(); ++i) {
-            IRValueRef idxConst = prog.addConstInt((int64_t)i, IRType::Int32);
-            IRValueRef keyVal = prog.addCall(
-                IRType::Int64,
-                reinterpret_cast<uint64_t>(getKeyFn),
-                {entryPtr, idxConst});
-            joinScope.bind(buildKeys[i],
-                           makeNonNullSQLValue(keyVal, buildKeys[i]->type, cg));
-        }
+    uint32_t headerBlk = prog.addBlock("hj_match_header");
+    uint32_t bodyBlk   = prog.addBlock("hj_match_body");
+    uint32_t exitBlk   = prog.addBlock("hj_match_exit");
 
-        // Bind build payload IUs from HTEntry::payloadData
-        for (size_t i = 0; i < buildPayloadIUs.size(); ++i) {
-            IRValueRef idxConst = prog.addConstInt((int64_t)i, IRType::Int32);
-            IRValueRef payloadVal = prog.addCall(
-                IRType::Int64,
-                reinterpret_cast<uint64_t>(getPayloadFn),
-                {entryPtr, idxConst});
-            joinScope.bind(buildPayloadIUs[i],
-                           makeNonNullSQLValue(payloadVal,
-                                               buildPayloadIUs[i]->type,
-                                               cg));
-        }
+    uint32_t entryBlk = prog.currentBlkIdx;
+    prog.addBranch(headerBlk);
+    prog.setInsertionPoint(prog.currentFnIdx, headerBlk);
 
-        if (parent) parent->consume(joinScope, this);
+    IRValueRef idxPhi = prog.addPhi(IRType::Int64, {{zero, entryBlk}, {NullRef, 0}});
+    IRValueRef hasMore = prog.addBinary(Opcode::CmpLt, IRType::Bool, idxPhi, totalMatches);
+    prog.addCondBranch(hasMore, bodyBlk, exitBlk);
+
+    prog.setInsertionPoint(prog.currentFnIdx, bodyBlk);
+
+    IRValueRef entryPtr = prog.addCall(
+        IRType::Ptr,
+        reinterpret_cast<uint64_t>(matchAtFn),
+        {matchesPtr, idxPhi});
+
+    // payload is at entry->payloadData.data()[i]
+    using GetPayloadFn = int64_t(*)(HTEntry*, int32_t);
+    static GetPayloadFn getPayloadFn = [](HTEntry* e, int32_t i) -> int64_t {
+        return e->payloadData[i];
+    };
+
+    ConsumerScope joinScope;
+    joinScope.mergeFrom(scope);  // include probe side values
+
+    // Bind build key IUs by loading from HTEntry::keyData
+    using GetKeyFn = int64_t(*)(HTEntry*, int32_t);
+    static GetKeyFn getKeyFn = [](HTEntry* e, int32_t i) -> int64_t {
+        return e->keyData[i];
+    };
+    for (size_t i = 0; i < buildKeys.size(); ++i) {
+        IRValueRef idxConst = prog.addConstInt((int64_t)i, IRType::Int32);
+        IRValueRef keyVal = prog.addCall(
+            IRType::Int64,
+            reinterpret_cast<uint64_t>(getKeyFn),
+            {entryPtr, idxConst});
+        joinScope.bind(buildKeys[i],
+                       makeNonNullSQLValue(keyVal, buildKeys[i]->type, cg));
     }
-    // IfStmt destructor closes the if block
+
+    // Bind build payload IUs from HTEntry::payloadData
+    for (size_t i = 0; i < buildPayloadIUs.size(); ++i) {
+        IRValueRef idxConst = prog.addConstInt((int64_t)i, IRType::Int32);
+        IRValueRef payloadVal = prog.addCall(
+            IRType::Int64,
+            reinterpret_cast<uint64_t>(getPayloadFn),
+            {entryPtr, idxConst});
+        joinScope.bind(buildPayloadIUs[i],
+                       makeNonNullSQLValue(payloadVal,
+                                           buildPayloadIUs[i]->type,
+                                           cg));
+    }
+
+    if (parent) parent->consume(joinScope, this);
+
+    IRValueRef idxNext = prog.addBinary(Opcode::Add, IRType::Int64, idxPhi, one);
+    uint32_t backEdgeBlk = prog.currentBlkIdx;
+    prog.patchPhiEntry(idxPhi, 1, idxNext, backEdgeBlk);
+    prog.addBranch(headerBlk);
+
+    prog.setInsertionPoint(prog.currentFnIdx, exitBlk);
 }

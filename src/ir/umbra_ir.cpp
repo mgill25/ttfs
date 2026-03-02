@@ -219,14 +219,20 @@ bool IRProgram::isConstant(IRValueRef ref) const {
 }
 
 int64_t IRProgram::constIntValue(IRValueRef ref) const {
-    assert(getInstr(ref)->op == Opcode::ConstInt);
-    return reinterpret_cast<const ConstIntInstr*>(getInstr(ref))->value;
+    const InstrHeader* h = getInstr(ref);
+    if (h->op == Opcode::ConstInt) {
+        return reinterpret_cast<const ConstIntInstr*>(h)->value;
+    }
+    if (h->op == Opcode::ConstBool) {
+        return reinterpret_cast<const ConstBoolInstr*>(h)->value ? 1 : 0;
+    }
+    throw std::runtime_error("constIntValue called for non-constant");
 }
 
 // ─── Constant folding ──────────────────────────────────────────────────────────
 
 IRValueRef IRProgram::tryConstFold(Opcode op, IRType t,
-                                    IRValueRef a, IRValueRef b) const {
+                                    IRValueRef a, IRValueRef b) {
     if (!isConstant(a) || !isConstant(b)) return NullRef;
 
     int64_t va = constIntValue(a);
@@ -248,19 +254,55 @@ IRValueRef IRProgram::tryConstFold(Opcode op, IRType t,
         case Opcode::And:   result = va & vb;  break;
         case Opcode::Or:    result = va | vb;  break;
         case Opcode::Xor:   result = va ^ vb;  break;
+        case Opcode::LAnd:  result = (va != 0) && (vb != 0); rtype = IRType::Bool; break;
+        case Opcode::LOr:   result = (va != 0) || (vb != 0); rtype = IRType::Bool; break;
         default:            return NullRef;
     }
 
-    // We can't call addConstInt here (const method), so return NullRef
-    // and let the caller handle it. In a full implementation we'd store
-    // the result. For simplicity we skip folding to avoid const cast issues.
-    (void)result; (void)rtype;
-    return NullRef;
+    if (rtype == IRType::Bool) {
+        return addConstBool(result != 0);
+    }
+    return addConstInt(result, rtype);
 }
 
 // ─── Dead code elimination ─────────────────────────────────────────────────────
 
 void IRProgram::eliminateDeadCode() {
+    // Remove instructions in unreachable blocks first.
+    for (auto& fn : functions) {
+        if (fn.blocks.empty()) continue;
+
+        std::vector<uint8_t> reachable(fn.blocks.size(), 0);
+        std::vector<uint32_t> worklist;
+        worklist.push_back(0);
+
+        while (!worklist.empty()) {
+            uint32_t bi = worklist.back();
+            worklist.pop_back();
+            if (bi >= fn.blocks.size() || reachable[bi]) continue;
+            reachable[bi] = 1;
+
+            const BasicBlock& blk = fn.blocks[bi];
+            if (blk.instructions.empty()) continue;
+
+            const InstrHeader* term = getInstr(blk.instructions.back());
+            if (term->op == Opcode::Branch) {
+                const auto* br = reinterpret_cast<const BranchInstr*>(term);
+                worklist.push_back(br->targetBlock);
+            } else if (term->op == Opcode::CondBranch) {
+                const auto* cbr = reinterpret_cast<const CondBranchInstr*>(term);
+                worklist.push_back(cbr->trueBlock);
+                worklist.push_back(cbr->falseBlock);
+            }
+        }
+
+        for (uint32_t bi = 0; bi < fn.blocks.size(); ++bi) {
+            if (!reachable[bi]) {
+                fn.blocks[bi].instructions.clear();
+            }
+        }
+    }
+
     // Count uses of every IRValueRef
     std::unordered_map<IRValueRef, int> useCounts;
 

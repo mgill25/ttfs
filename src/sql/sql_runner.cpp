@@ -23,6 +23,8 @@
 #include <iomanip>
 #include <sstream>
 #include <stdexcept>
+#include <unordered_set>
+#include <functional>
 
 // ─── PrintTranslator ──────────────────────────────────────────────────────────
 // Root consumer operator. Emits a Call IR instruction to a trampoline that
@@ -88,6 +90,21 @@ struct PrintTranslator : OperatorTranslator {
 #include "../operators/select_translator.hpp"
 #include "../operators/hash_join_translator.hpp"
 
+static void deleteOperatorTree(OperatorTranslator* op,
+                               std::unordered_set<OperatorTranslator*>& seen) {
+    if (!op || seen.count(op)) return;
+    seen.insert(op);
+
+    if (auto* sel = dynamic_cast<SelectTranslator*>(op)) {
+        deleteOperatorTree(sel->childOp(), seen);
+    } else if (auto* hj = dynamic_cast<HashJoinTranslator*>(op)) {
+        deleteOperatorTree(hj->buildSideOp(), seen);
+        deleteOperatorTree(hj->probeSideOp(), seen);
+    }
+
+    delete op;
+}
+
 static void printOperatorTree(OperatorTranslator* op, std::ostream& out,
                                const std::string& prefix = "",
                                const std::string& childPrefix = "") {
@@ -135,6 +152,18 @@ QueryResult runQuery(const std::string& sql,
     // Step 4: Plan → build OperatorTranslator tree (Tidy Tuples Layer 1)
     QueryPlanner planner(ctx, catalog);
     PlanResult plan = planner.plan(stmt);
+
+    bool planCleaned = false;
+    auto cleanupPlan = [&]() {
+        if (planCleaned) return;
+        std::unordered_set<OperatorTranslator*> seen;
+        deleteOperatorTree(plan.root, seen);
+        planCleaned = true;
+    };
+    struct CleanupGuard {
+        std::function<void()> fn;
+        ~CleanupGuard() { fn(); }
+    } cleanupGuard{cleanupPlan};
 
     // ── EXPLAIN: operator tree ─────────────────────────────────────────────
     if (explain && explain->showTree) {
@@ -194,6 +223,7 @@ QueryResult runQuery(const std::string& sql,
         backend.release(fn);
         QueryResult qr;
         qr.columnNames = plan.columnNames;
+        cleanupPlan();
         return qr;
     }
 
@@ -212,5 +242,6 @@ QueryResult runQuery(const std::string& sql,
     if (stmt.limit >= 0 && (int64_t)qr.rows.size() > stmt.limit)
         qr.rows.resize((size_t)stmt.limit);
 
+    cleanupPlan();
     return qr;
 }

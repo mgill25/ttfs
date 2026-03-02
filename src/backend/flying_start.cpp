@@ -140,10 +140,10 @@ static inline void emit_lea(AsmCompiler& cc, AsmGp dst, AsmGp base, int32_t offs
     cc.lea(dst, asmjit::x86::ptr(base, offset));
 }
 
-// Comparison: emit cmp a, b then conditional jump
-static inline void emit_cmp_branch(AsmCompiler& cc, Opcode cmpOp,
-                                     AsmGp a, AsmGp b,
-                                     Label trueLabel, Label falseLabel) {
+// Emit cmp a, b then jump to trueLabel if condition holds.
+static inline void emit_cmp_jump_true(AsmCompiler& cc, Opcode cmpOp,
+                                        AsmGp a, AsmGp b,
+                                        Label trueLabel) {
     cc.cmp(a, b);
     switch (cmpOp) {
         case Opcode::CmpEq: cc.je(trueLabel);  break;
@@ -154,15 +154,29 @@ static inline void emit_cmp_branch(AsmCompiler& cc, Opcode cmpOp,
         case Opcode::CmpGe: cc.jge(trueLabel); break;
         default:            cc.jnz(trueLabel); break;
     }
-    cc.jmp(falseLabel);
 }
 
-// Non-fused: test cond + jnz/jmp
-static inline void emit_test_branch(AsmCompiler& cc, AsmGp cond,
-                                     Label trueLabel, Label falseLabel) {
+// Materialize comparison result into dst (0/1).
+static inline void emit_cmp_set(AsmCompiler& cc, Opcode cmpOp,
+                                 AsmGp dst, AsmGp a, AsmGp b) {
+    cc.cmp(a, b);
+    switch (cmpOp) {
+        case Opcode::CmpEq: cc.sete(dst.r8());  break;
+        case Opcode::CmpNe: cc.setne(dst.r8()); break;
+        case Opcode::CmpLt: cc.setl(dst.r8());  break;
+        case Opcode::CmpGt: cc.setg(dst.r8());  break;
+        case Opcode::CmpLe: cc.setle(dst.r8()); break;
+        case Opcode::CmpGe: cc.setge(dst.r8()); break;
+        default:            cc.setne(dst.r8()); break;
+    }
+    cc.movzx(dst.r32(), dst.r8());
+}
+
+// Non-fused: test cond and jump on true.
+static inline void emit_test_jump_true(AsmCompiler& cc, AsmGp cond,
+                                        Label trueLabel) {
     cc.test(cond, cond);
     cc.jnz(trueLabel);
-    cc.jmp(falseLabel);
 }
 static inline void emit_jmp(AsmCompiler& cc, Label target) {
     cc.jmp(target);
@@ -222,9 +236,9 @@ static inline void emit_lea(AsmCompiler& cc, AsmGp dst, AsmGp base, int32_t offs
 }
 
 // ARM64 comparisons: cmp + b.cc
-static inline void emit_cmp_branch(AsmCompiler& cc, Opcode cmpOp,
-                                     AsmGp a, AsmGp b,
-                                     Label trueLabel, Label falseLabel) {
+static inline void emit_cmp_jump_true(AsmCompiler& cc, Opcode cmpOp,
+                                        AsmGp a, AsmGp b,
+                                        Label trueLabel) {
     cc.cmp(a, b);
     switch (cmpOp) {
         case Opcode::CmpEq: cc.b_eq(trueLabel); break;
@@ -235,13 +249,26 @@ static inline void emit_cmp_branch(AsmCompiler& cc, Opcode cmpOp,
         case Opcode::CmpGe: cc.b_ge(trueLabel); break;
         default:            cc.b_ne(trueLabel); break;
     }
-    cc.b(falseLabel);
 }
 
-static inline void emit_test_branch(AsmCompiler& cc, AsmGp cond,
-                                     Label trueLabel, Label falseLabel) {
+// Materialize comparison result into dst (0/1).
+static inline void emit_cmp_set(AsmCompiler& cc, Opcode cmpOp,
+                                 AsmGp dst, AsmGp a, AsmGp b) {
+    cc.cmp(a, b);
+    switch (cmpOp) {
+        case Opcode::CmpEq: cc.cset(dst, imm(arm::CondCode::kEQ)); break;
+        case Opcode::CmpNe: cc.cset(dst, imm(arm::CondCode::kNE)); break;
+        case Opcode::CmpLt: cc.cset(dst, imm(arm::CondCode::kLT)); break;
+        case Opcode::CmpGt: cc.cset(dst, imm(arm::CondCode::kGT)); break;
+        case Opcode::CmpLe: cc.cset(dst, imm(arm::CondCode::kLE)); break;
+        case Opcode::CmpGe: cc.cset(dst, imm(arm::CondCode::kGE)); break;
+        default:            cc.cset(dst, imm(arm::CondCode::kNE)); break;
+    }
+}
+
+static inline void emit_test_jump_true(AsmCompiler& cc, AsmGp cond,
+                                        Label trueLabel) {
     cc.cbnz(cond, trueLabel);
-    cc.b(falseLabel);
 }
 static inline void emit_jmp(AsmCompiler& cc, Label target) {
     cc.b(target);
@@ -259,7 +286,8 @@ struct Translator {
     std::unordered_map<IRValueRef, AsmGp> regMap;
     std::unordered_map<uint32_t,   Label> blockLabels;
     std::unordered_map<IRValueRef, AsmGp> phiRegs;
-    std::unordered_map<IRValueRef, IRValueRef> pendingCmps;
+    std::unordered_map<IRValueRef, uint32_t> useCounts;
+    std::unordered_map<IRValueRef, bool> deferredCmps;
 
     int& regsUsed;
     int& fused;
@@ -310,6 +338,88 @@ struct Translator {
             blockLabels[bi] = cc.new_label();
     }
 
+    void computeUseCounts() {
+        auto countUse = [&](IRValueRef ref) {
+            if (ref != NullRef && !prog.isParam(ref)) useCounts[ref]++;
+        };
+
+        for (const BasicBlock& blk : fn.blocks) {
+            for (IRValueRef ref : blk.instructions) {
+                const InstrHeader* h = prog.getInstr(ref);
+                switch (h->op) {
+                case Opcode::Add: case Opcode::Sub: case Opcode::Mul:
+                case Opcode::Div: case Opcode::Rem: case Opcode::And:
+                case Opcode::Or:  case Opcode::Xor: case Opcode::Shl:
+                case Opcode::Shr: case Opcode::CRC32:
+                case Opcode::CmpEq: case Opcode::CmpNe:
+                case Opcode::CmpLt: case Opcode::CmpGt:
+                case Opcode::CmpLe: case Opcode::CmpGe:
+                case Opcode::LAnd: case Opcode::LOr:
+                case Opcode::Store: {
+                    auto* bi = reinterpret_cast<const BinaryInstr*>(h);
+                    countUse(bi->arg0);
+                    countUse(bi->arg1);
+                    break;
+                }
+                case Opcode::Load: case Opcode::ZExt: case Opcode::SExt:
+                case Opcode::LNot: case Opcode::IsNull: {
+                    auto* ui = reinterpret_cast<const UnaryInstr*>(h);
+                    countUse(ui->arg0);
+                    break;
+                }
+                case Opcode::RotateRight: {
+                    auto* ri = reinterpret_cast<const RotateRightInstr*>(h);
+                    countUse(ri->arg0);
+                    break;
+                }
+                case Opcode::GEP: {
+                    auto* gi = reinterpret_cast<const GEPInstr*>(h);
+                    countUse(gi->base);
+                    break;
+                }
+                case Opcode::CondBranch: {
+                    auto* cbi = reinterpret_cast<const CondBranchInstr*>(h);
+                    countUse(cbi->cond);
+                    break;
+                }
+                case Opcode::Return: {
+                    auto* ri = reinterpret_cast<const ReturnInstr*>(h);
+                    countUse(ri->value);
+                    break;
+                }
+                case Opcode::Phi: {
+                    auto* ph = reinterpret_cast<const PhiHeader*>(h);
+                    const PhiEntry* entries = reinterpret_cast<const PhiEntry*>(ph + 1);
+                    for (uint32_t i = 0; i < ph->numEntries; ++i)
+                        countUse(entries[i].value);
+                    break;
+                }
+                case Opcode::Call: {
+                    auto* ch = reinterpret_cast<const CallHeader*>(h);
+                    const IRValueRef* args = reinterpret_cast<const IRValueRef*>(ch + 1);
+                    for (uint32_t i = 0; i < ch->numArgs; ++i)
+                        countUse(args[i]);
+                    break;
+                }
+                default:
+                    break;
+                }
+            }
+        }
+    }
+
+    bool canDeferComparison(IRValueRef cmpRef, uint32_t blockIdx) const {
+        auto it = useCounts.find(cmpRef);
+        if (it == useCounts.end() || it->second != 1) return false;
+        const BasicBlock& blk = fn.blocks[blockIdx];
+        if (blk.instructions.empty()) return false;
+        IRValueRef lastRef = blk.instructions.back();
+        const InstrHeader* last = prog.getInstr(lastRef);
+        if (last->op != Opcode::CondBranch) return false;
+        const auto* cbr = reinterpret_cast<const CondBranchInstr*>(last);
+        return cbr->cond == cmpRef;
+    }
+
     void findPhis() {
         for (uint32_t bi = 0; bi < fn.blocks.size(); ++bi) {
             for (IRValueRef ref : fn.blocks[bi].instructions) {
@@ -327,6 +437,7 @@ struct Translator {
     void translateFunction() {
         cc.add_func(FuncSignature::build<void>());
         allocLabels();
+        computeUseCounts();
         findPhis();
         for (uint32_t bi = 0; bi < fn.blocks.size(); ++bi)
             translateBlock(bi);
@@ -434,9 +545,18 @@ struct Translator {
         // Optimization 4: Comparison-Branch Fusion
         case Opcode::CmpEq: case Opcode::CmpNe:
         case Opcode::CmpLt: case Opcode::CmpGt:
-        case Opcode::CmpLe: case Opcode::CmpGe:
-            pendingCmps[ref] = ref;
+        case Opcode::CmpLe: case Opcode::CmpGe: {
+            if (canDeferComparison(ref, blkIdx)) {
+                deferredCmps[ref] = true;
+            } else {
+                auto* i = reinterpret_cast<const BinaryInstr*>(h);
+                auto dst = cc.new_gp64();
+                emit_cmp_set(cc, h->op, dst, getValue(i->arg0), getValue(i->arg1));
+                regMap[ref] = dst;
+                ++regsUsed;
+            }
             break;
+        }
 
         // Optimization 3: Lazy Address Calculation (GEP → LEA)
         case Opcode::GEP: {
@@ -534,31 +654,34 @@ struct Translator {
     void translateCondBranch(const CondBranchInstr& i, uint32_t blkIdx) {
         Label trueLabel  = blockLabels[i.trueBlock];
         Label falseLabel = blockLabels[i.falseBlock];
+        Label trueEdgeLabel = cc.new_label();
 
-        auto it = pendingCmps.find(i.cond);
-        if (it != pendingCmps.end()) {
-            IRValueRef cmpRef = it->second;
+        auto it = deferredCmps.find(i.cond);
+        if (it != deferredCmps.end()) {
+            IRValueRef cmpRef = i.cond;
             const InstrHeader* ch = prog.getInstr(cmpRef);
             const BinaryInstr* ci = reinterpret_cast<const BinaryInstr*>(ch);
 
             AsmGp a = getValue(ci->arg0);
             AsmGp b = getValue(ci->arg1);
 
-            // Emit PHI moves before the branch
-            emitPhiMovesForEdge(blkIdx, i.trueBlock);
-
-            // Fused cmp + conditional branch (Optimization 4)
-            emit_cmp_branch(cc, ch->op, a, b, trueLabel, falseLabel);
-
+            // Fused cmp + branch, while keeping PHI moves edge-specific.
+            emit_cmp_jump_true(cc, ch->op, a, b, trueEdgeLabel);
             emitPhiMovesForEdge(blkIdx, i.falseBlock);
-            // Note: jmp to false already emitted by emit_cmp_branch
-            pendingCmps.erase(it);
+            emit_jmp(cc, falseLabel);
+            cc.bind(trueEdgeLabel);
+            emitPhiMovesForEdge(blkIdx, i.trueBlock);
+            emit_jmp(cc, trueLabel);
+            deferredCmps.erase(it);
             ++fused;
         } else {
             AsmGp cond = getValue(i.cond);
-            emitPhiMovesForEdge(blkIdx, i.trueBlock);
-            emit_test_branch(cc, cond, trueLabel, falseLabel);
+            emit_test_jump_true(cc, cond, trueEdgeLabel);
             emitPhiMovesForEdge(blkIdx, i.falseBlock);
+            emit_jmp(cc, falseLabel);
+            cc.bind(trueEdgeLabel);
+            emitPhiMovesForEdge(blkIdx, i.trueBlock);
+            emit_jmp(cc, trueLabel);
         }
     }
 

@@ -25,6 +25,7 @@ struct HTEntry {
 struct RuntimeHashTable {
     static constexpr size_t NUM_BUCKETS = 1024;
     std::vector<std::list<HTEntry>> buckets;
+    std::vector<HTEntry*> matchBuffer;
     int numKeyFields    = 0;
     int numPayloadFields = 0;
 
@@ -35,9 +36,12 @@ struct RuntimeHashTable {
                        const int64_t* keys, const int64_t* payload,
                        int numKeys, int numPayload);
 
-    // Returns a pointer to the first matching entry chain, or nullptr
-    static HTEntry* lookup(RuntimeHashTable* ht, uint64_t hash,
-                            const int64_t* probeKeys, int numKeys);
+    // Returns all matching entries for a probe key (buffer owned by ht).
+    static RuntimeHashTable* lookupAll(RuntimeHashTable* ht, uint64_t hash,
+                                       const int64_t* probeKeys, int numKeys);
+
+    static int64_t matchCount(RuntimeHashTable* ht);
+    static HTEntry* matchAt(RuntimeHashTable* ht, int64_t idx);
 };
 
 class HashJoinTranslator : public OperatorTranslator {

@@ -2,6 +2,7 @@
 
 CXX      = c++
 BIN      = bin/umbra
+TEST_BIN = bin/umbra_tests
 
 # asmJIT is in third_party/asmjit/asmjit/ (the asmjit source tree)
 # Include path: -Ithird_party/asmjit so that #include <asmjit/asmjit.h> resolves
@@ -21,24 +22,29 @@ ASMJIT_SRCS = $(wildcard $(ASMJIT_DIR)/core/*.cpp)    \
               $(wildcard $(ASMJIT_DIR)/support/*.cpp)
 
 # Project sources
-SRCS = src/main.cpp \
-       src/ir/umbra_ir.cpp \
-       src/operators/scan_translator.cpp \
-       src/operators/select_translator.cpp \
-       src/operators/hash_join_translator.cpp \
-       src/backend/flying_start.cpp \
-       src/sql/sql_lexer.cpp \
-       src/sql/sql_parser.cpp \
-       src/sql/sql_catalog.cpp \
-       src/sql/sql_planner.cpp \
-       src/sql/sql_runner.cpp \
-       $(ASMJIT_SRCS)
+COMMON_SRCS = src/ir/umbra_ir.cpp \
+              src/operators/scan_translator.cpp \
+              src/operators/select_translator.cpp \
+              src/operators/hash_join_translator.cpp \
+              src/backend/flying_start.cpp \
+              src/sql/sql_lexer.cpp \
+              src/sql/sql_parser.cpp \
+              src/sql/sql_catalog.cpp \
+              src/sql/sql_planner.cpp \
+              src/sql/sql_runner.cpp
 
-.PHONY: all run demo clean
+APP_SRCS = src/main.cpp $(COMMON_SRCS) $(ASMJIT_SRCS)
+TEST_SRCS = tests/test_runner.cpp $(COMMON_SRCS) $(ASMJIT_SRCS)
+
+.PHONY: all run demo test clean
 
 all: $(BIN)
 
-$(BIN): $(SRCS)
+$(BIN): $(APP_SRCS)
+	@mkdir -p bin
+	$(CXX) $(CXXFLAGS_RELEASE) -o $@ $^
+
+$(TEST_BIN): $(TEST_SRCS)
 	@mkdir -p bin
 	$(CXX) $(CXXFLAGS_RELEASE) -o $@ $^
 
@@ -47,6 +53,9 @@ run: $(BIN)
 
 demo: $(BIN)
 	./$(BIN) --demo
+
+test: $(TEST_BIN)
+	./$(TEST_BIN)
 
 clean:
 	rm -rf bin umbra-demo

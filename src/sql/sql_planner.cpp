@@ -102,12 +102,12 @@ SQLValue QueryPlanner::evalExpr(const Expr* e, ConsumerScope& scope) {
         case BinOpKind::Add: return l.add(r);
         case BinOpKind::Sub: return l.sub(r);
         case BinOpKind::And: {
-            // Logical AND: treat as integer truth value (result is Bool)
-            return l.eq(makeIntSQLValue(ctx.codegen, 0)).ne(r);
+            Bool b = l.asBool() && r.asBool();
+            return {b.ref, NullRef, SQLType::Bool, &ctx.codegen};
         }
         case BinOpKind::Or: {
-            // Logical OR (rarely needed in WHERE top-level)
-            return l.ne(makeIntSQLValue(ctx.codegen, 0));
+            Bool b = l.asBool() || r.asBool();
+            return {b.ref, NullRef, SQLType::Bool, &ctx.codegen};
         }
         }
         break;
